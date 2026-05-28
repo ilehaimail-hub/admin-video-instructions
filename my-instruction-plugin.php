@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Admin Video Instructions
  * Description: Видеоматериалы для обучения — страница инструкции в админке WordPress.
- * Version: 1.0.1
+ * Version: 1.0.0
  * Author: Allvisio
  * License: GPL v2 or later
  * Text Domain: my-instruction-plugin
