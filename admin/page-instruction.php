@@ -6,6 +6,32 @@ if (!defined('ABSPATH')) {
 $data       = instr_get_data();
 $categories = $data['categories'];
 $videos     = $data['videos'];
+
+/**
+ * Определение внешнего видео (YouTube/Vimeo) и рендеринг превью.
+ */
+function instr_render_video_preview($url) {
+    if (empty($url)) return '';
+
+    // YouTube
+    if (preg_match('/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/', $url, $yt)) {
+        return '<div class="video-embed-responsive"><iframe src="https://www.youtube.com/embed/'
+            . esc_attr($yt[1]) . '?rel=0" frameborder="0" allowfullscreen'
+            . ' allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"></iframe></div>';
+    }
+
+    // Vimeo
+    if (preg_match('/vimeo\.com\/(?:video\/)?(\d+)/', $url, $vm)) {
+        return '<div class="video-embed-responsive"><iframe src="https://player.vimeo.com/video/'
+            . esc_attr($vm[1]) . '" frameborder="0" allowfullscreen></iframe></div>';
+    }
+
+    // Локальное видео
+    return '<video width="620" height="340" controls preload="none"><source src="'
+        . esc_url($url) . '" type="video/mp4">'
+        . esc_html__('Ваш браузер не поддерживает воспроизведение видео.', 'my-instruction-plugin')
+        . '</video>';
+}
 ?>
 <div class="instr-wrap">
 
@@ -90,9 +116,7 @@ $videos     = $data['videos'];
 
                             <div class="video_preview">
                                 <?php if ($video['url']): ?>
-                                    <video width="620" height="340" controls>
-                                        <source src="<?php echo esc_url($video['url']); ?>" type="video/mp4">
-                                    </video>
+                                    <?php echo instr_render_video_preview($video['url']); ?>
                                 <?php else: ?>
                                     <div class="video-empty"><?php echo instr_svg_kses('film'); ?><p><?php esc_html_e( 'Видео не загружено', 'my-instruction-plugin' ); ?></p></div>
                                 <?php endif; ?>
@@ -100,8 +124,29 @@ $videos     = $data['videos'];
 
                             <div class="video_controls">
                                 <button type="button" class="btn btn--upload upload_video_button"><?php echo instr_svg_kses('upload'); ?> <?php esc_html_e( 'Загрузить видео', 'my-instruction-plugin' ); ?></button>
+                                <button type="button" class="btn btn--ghost paste_url_button">🔗 <?php esc_html_e( 'URL', 'my-instruction-plugin' ); ?></button>
                                 <button type="button" class="btn btn--danger remove_video_button"><?php echo instr_svg_kses('trash'); ?> <?php esc_html_e( 'Удалить', 'my-instruction-plugin' ); ?></button>
                             </div>
+
+                            <?php if (count($categories) > 1): ?>
+                            <div class="video-move">
+                                <span class="video-move__label"><?php esc_html_e('В категорию:', 'my-instruction-plugin'); ?> </span>
+                                <div class="instr-dropdown" data-category="<?php echo esc_attr($cat); ?>">
+                                    <button type="button" class="instr-dropdown__toggle">
+                                        <span class="instr-dropdown__toggle-text"><?php echo esc_html($cat); ?></span>
+                                        <span class="instr-dropdown__arrow"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+                                    </button>
+                                    <div class="instr-dropdown__menu">
+                                        <?php foreach ($categories as $c): ?>
+                                            <button type="button" class="instr-dropdown__item<?php echo $c === $cat ? ' is-active' : ''; ?>" data-value="<?php echo esc_attr($c); ?>">
+                                                <span class="instr-dropdown__item-icon"><?php echo instr_svg_kses('folder'); ?></span>
+                                                <?php echo esc_html($c); ?>
+                                            </button>
+                                        <?php endforeach; ?>
+                                    </div>
+                                </div>
+                            </div>
+                            <?php endif; ?>
                         </div>
                     <?php endforeach; ?>
                 </div>

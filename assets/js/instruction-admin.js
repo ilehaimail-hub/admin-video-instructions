@@ -2,14 +2,163 @@
 (function($) {
     'use strict';
 
+    // ════════════════════════════════════════════
+    //  КОНСТАНТЫ И УТИЛИТЫ
+    // ════════════════════════════════════════════
+
+    var ANIMATION_DURATION = 350;
+    var REMOVE_TIMEOUT = 400;
+    var AJAX_THROTTLE_MS = 500;
+    var lastAjaxTime = 0;
+
+    /**
+     * Безопасное создание SVG-элемента из строки через DOM-парсинг.
+     * Предотвращает XSS-уязвимости при вставке SVG.
+     */
+    function createSvgElement(svgString) {
+        var template = document.createElement('template');
+        template.innerHTML = svgString.trim();
+        return template.content.firstChild;
+    }
+
+    /**
+     * Безопасная вставка SVG в jQuery-элемент.
+     * Вместо .html() использует DOM-appendChild.
+     */
+    function appendSvg($element, svgString) {
+        var svgEl = createSvgElement(svgString);
+        if (svgEl) {
+            $element.each(function() {
+                this.appendChild(svgEl.cloneNode(true));
+            });
+        }
+        return $element;
+    }
+
+    /**
+     * Проверка MIME-типа файла — является ли видео.
+     */
+    function isVideoMimeType(mime) {
+        return mime && mime.indexOf('video/') === 0;
+    }
+
+    /**
+     * Формирование имени поля для формы отправки.
+     */
+    function videoFieldName(cat, idx, field) { return 'cat_videos[' + cat + '][' + idx + '][' + field + ']'; }
+
+    /**
+     * Парсинг URL внешних видео (YouTube, Vimeo).
+     * Возвращает { type: 'youtube'|'vimeo'|null, id: '...', embedUrl: '...' } или null.
+     */
+    function parseExternalVideoUrl(url) {
+        if (!url) return null;
+        url = $.trim(url);
+
+        // YouTube: various formats
+        var yt = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+        if (yt) {
+            return { type: 'youtube', id: yt[1], embedUrl: 'https://www.youtube.com/embed/' + yt[1] + '?rel=0' };
+        }
+
+        // Vimeo
+        var vm = url.match(/vimeo\.com\/(?:video\/)?(\d+)/);
+        if (vm) {
+            return { type: 'vimeo', id: vm[1], embedUrl: 'https://player.vimeo.com/video/' + vm[1] };
+        }
+
+        return null;
+    }
+
+    /**
+     * Создание DOM-элемента превью видео (локальное, YouTube или Vimeo).
+     * Возвращает jQuery-обёрнутый элемент.
+     */
+    function renderVideoPreview(url) {
+        var ext = parseExternalVideoUrl(url);
+        if (ext) {
+            var $wrapper = $('<div/>', { 'class': 'video-embed-responsive' });
+            $('<iframe/>', {
+                src: ext.embedUrl,
+                frameborder: '0',
+                allowfullscreen: true,
+                allow: 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture'
+            }).appendTo($wrapper);
+            return $wrapper;
+        }
+        // Локальное видео
+        var $video = $('<video/>', { controls: true, preload: 'none' })
+            .append($('<source/>', { src: url, type: 'video/mp4' }))
+            .append(document.createTextNode(instrAdminVars.fallback_text));
+        return $video;
+    }
+
+    /**
+     * Установка видео в карточку (обновляет превью, hidden-поля и заголовок).
+     */
+    function setVideoInEntry($entry, url, title, cat) {
+        var idx = $entry.find('.editable-title').data('index');
+        if (!cat) cat = $entry.find('.editable-title').data('category');
+        $entry.find('input[data-field="url"]').val(url).attr('name', videoFieldName(cat, idx, 'url'));
+        $entry.find('.video_preview').empty().append(renderVideoPreview(url));
+        if (title) {
+            $entry.find('.editable-title').text(title);
+            $entry.find('input[data-field="title"]').val(title).attr('name', videoFieldName(cat, idx, 'title'));
+        }
+    }
+
     $(function() {
         var $wrap = $('.instr-wrap');
         var $editBtn = $('#edit_videos');
         var isEditing = true;
-        var ajaxUrl = instrAdminVars.ajax_url || window.ajaxurl;
-        var ajaxNonce = instrAdminVars.nonce || '';
+        // Делаем доступными глобально для обработчиков, вешанных через $(document).on()
+        window._instrAjaxUrl = instrAdminVars.ajax_url || window.ajaxurl;
+        window._instrAjaxNonce = instrAdminVars.nonce || '';
+        var ajaxUrl = window._instrAjaxUrl;
+        var ajaxNonce = window._instrAjaxNonce;
+
+        /**
+         * Загрузка файла через WP async-upload.
+         */
+        function uploadVideoFile(file, onSuccess, onError) {
+            var formData = new FormData();
+            formData.append('action', 'upload-attachment');
+            formData.append('_wpnonce', instrAdminVars.upload_nonce || '');
+            formData.append('async-upload', file);
+            formData.append('name', file.name);
+
+            $.ajax({
+                url: window._instrAjaxUrl,
+                type: 'POST',
+                data: formData,
+                processData: false,
+                contentType: false,
+                dataType: 'json',
+                success: function(res) {
+                    if (res && res.success && res.data) {
+                        onSuccess({
+                            url: res.data.url || (res.data.sizes && res.data.sizes.full ? res.data.sizes.full.url : ''),
+                            title: res.data.title || file.name,
+                            mime: res.data.mime || file.type,
+                            id: res.data.id
+                        });
+                    } else {
+                        onError((res && res.data && res.data.message) || 'Ошибка загрузки файла.');
+                    }
+                },
+                error: function() {
+                    onError('Ошибка сети при загрузке файла.');
+                }
+            });
+        }
 
         function ajaxPost(action, data, done) {
+            // Rate limiting — минимум AJAX_THROTTLE_MS между запросами
+            var now = Date.now();
+            if (now - lastAjaxTime < AJAX_THROTTLE_MS) {
+                return $.Deferred().reject('throttled');
+            }
+            lastAjaxTime = now;
             return $.post(ajaxUrl, $.extend({ action: action, nonce: ajaxNonce }, data || {}), done, 'json')
                 .fail(function() { showAlert('Ошибка сети.'); });
         }
@@ -24,7 +173,6 @@
 
         function findPanel(cat) { return $('.instr-cat-panel').filter(function() { return $(this).data('category') === cat; }); }
         function findTab(cat) { return $('.instr-tab:not(.instr-tab--add)').filter(function() { return $(this).data('category') === cat; }); }
-        function videoFieldName(cat, idx, field) { return 'cat_videos[' + cat + '][' + idx + '][' + field + ']'; }
 
         // ════════════════════════════════════════════
         //  ТАБЫ КАТЕГОРИЙ
@@ -60,14 +208,25 @@
         });
 
         function renderNewTab(name) {
-            $('<div/>', { 'class': 'instr-tab' }).data('category', name)
-                .append($('<span/>', { 'class': 'instr-tab__icon', html: instrAdminVars.folder_svg }))
-                .append($('<span/>', { 'class': 'instr-tab__name', text: name }))
-                .append($('<span/>', { 'class': 'instr-tab__count', text: '0' }))
-                .append($('<div/>', { 'class': 'instr-tab__actions' })
-                    .append($('<button/>', { type: 'button', 'class': 'instr-tab__rename', title: 'Переименовать', html: instrAdminVars.pencil_svg }))
-                    .append($('<button/>', { type: 'button', 'class': 'instr-tab__remove', title: 'Удалить категорию', html: instrAdminVars.trash_svg })))
-                .insertBefore('#add_category_btn').hide().fadeIn(250);
+            var $tab = $('<div/>', { 'class': 'instr-tab' }).data('category', name);
+
+            var $icon = $('<span/>', { 'class': 'instr-tab__icon' });
+            appendSvg($icon, instrAdminVars.folder_svg);
+            $tab.append($icon);
+
+            $tab.append($('<span/>', { 'class': 'instr-tab__name', text: name }));
+            $tab.append($('<span/>', { 'class': 'instr-tab__count', text: '0' }));
+
+            var $actions = $('<div/>', { 'class': 'instr-tab__actions' });
+            var $renameBtn = $('<button/>', { type: 'button', 'class': 'instr-tab__rename', title: 'Переименовать' });
+            appendSvg($renameBtn, instrAdminVars.pencil_svg);
+            $actions.append($renameBtn);
+
+            var $removeBtn = $('<button/>', { type: 'button', 'class': 'instr-tab__remove', title: 'Удалить категорию' });
+            appendSvg($removeBtn, instrAdminVars.trash_svg);
+            $actions.append($removeBtn);
+
+            $tab.append($actions).insertBefore('#add_category_btn').hide().fadeIn(250);
         }
 
         function renderNewPanel(name) {
@@ -75,12 +234,24 @@
             var $panel = $('<div/>', { 'class': 'instr-cat-panel' }).data('category', name).attr('data-category', name);
             $('<input/>', { type: 'hidden', name: 'categories[' + Date.now() + ']', value: name }).appendTo($panel);
             $('<div/>', { 'class': 'instr-cat-container', id: id, 'data-empty-text': instrAdminVars.no_videos_in_cat }).appendTo($panel);
-            $('<div/>', { 'class': 'instr-cat-footer' })
-                .append($('<button/>', { type: 'button', 'class': 'btn btn--add add_video_button' }).data('category', name).html(instrAdminVars.plus_svg + ' ' + instrAdminVars.add_video_label))
-                .append($('<button/>', { type: 'submit', name: 'save_videos', 'class': 'btn btn--primary save_cat_btn', html: instrAdminVars.check_svg + ' ' + instrAdminVars.save_label }))
-                .appendTo($panel);
+            
+            // Footer с кнопками — безопасная вставка SVG
+            var $footer = $('<div/>', { 'class': 'instr-cat-footer' });
+            
+            var $addBtn = $('<button/>', { type: 'button', 'class': 'btn btn--add add_video_button' })
+                .data('category', name)
+                .append(createSvgElement(instrAdminVars.plus_svg))
+                .append(document.createTextNode(' ' + instrAdminVars.add_video_label));
+            $footer.append($addBtn);
+            
+            var $saveBtn = $('<button/>', { type: 'submit', name: 'save_videos', 'class': 'btn btn--primary save_cat_btn' })
+                .append(createSvgElement(instrAdminVars.check_svg))
+                .append(document.createTextNode(' ' + instrAdminVars.save_label));
+            $footer.append($saveBtn);
+            
+            $footer.appendTo($panel);
             $panel.appendTo('form').hide().fadeIn(300);
-            $('#' + escSelector(id)).sortable($.extend({}, sortableOpts, { update: function() { reindexCat(name); } }));
+            initSortable($('#' + escSelector(id)));
         }
 
         // ─── Удаление категории (AJAX) ────────────────
@@ -134,15 +305,42 @@
         //  ВИДЕО (внутри категорий)
         // ════════════════════════════════════════════
 
-        var sortableOpts = { handle: '.video-entry__drag', axis: 'y', opacity: .8, placeholder: 'sortable-placeholder', forcePlaceholderSize: true, tolerance: 'pointer', cursor: 'grabbing' };
+        var sortableOpts = {
+            handle: '.video-entry__drag',
+            axis: 'y',
+            opacity: .8,
+            placeholder: 'sortable-placeholder',
+            forcePlaceholderSize: true,
+            tolerance: 'pointer',
+            cursor: 'grabbing',
+            connectWith: '.instr-cat-container'
+        };
 
-        $('.instr-cat-container').each(function() {
-            var $c = $(this);
-            if (!$c.data('sortable-init')) {
-                $c.sortable($.extend({}, sortableOpts, { update: function() { reindexCat($c.closest('.instr-cat-panel').data('category')); } }));
-                $c.data('sortable-init', true);
-            }
-        });
+        function initSortable($c) {
+            if ($c.data('sortable-init')) return;
+            $c.sortable($.extend({}, sortableOpts, {
+                update: function(e, ui) {
+                    var $thisContainer = $(this);
+                    var newCat = $thisContainer.closest('.instr-cat-panel').data('category');
+                    if (ui.sender) {
+                        var oldCat = ui.sender.closest('.instr-cat-panel').data('category');
+                        var $entry = ui.item;
+                        $entry.find('.editable-title').attr('data-category', newCat).data('category', newCat);
+                        var newIdx = $entry.index();
+                        $entry.find('input[data-field="title"]').attr('name', videoFieldName(newCat, newIdx, 'title'));
+                        $entry.find('input[data-field="url"]').attr('name', videoFieldName(newCat, newIdx, 'url'));
+                        updateDropdownOnMove($entry, newCat);
+                        reindexCat(oldCat);
+                        reindexCat(newCat);
+                    } else {
+                        reindexCat(newCat);
+                    }
+                }
+            }));
+            $c.data('sortable-init', true);
+        }
+
+        $('.instr-cat-container').each(function() { initSortable($(this)); });
 
         function reindexCat(cat) {
             var $panel = findPanel(cat);
@@ -161,28 +359,98 @@
         }
 
         // ─── Добавление нового видео ──────────────────
+        var DRAG_HANDLE_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><circle cx="5" cy="4" r="1.3"/><circle cx="11" cy="4" r="1.3"/><circle cx="5" cy="8" r="1.3"/><circle cx="11" cy="8" r="1.3"/><circle cx="5" cy="12" r="1.3"/><circle cx="11" cy="12" r="1.3"/></svg>';
+
         $(document).on('click', '.add_video_button', function() {
             if (!isEditing) setEditMode();
             var cat = $(this).data('category');
             if (!cat) return;
             var $container = findPanel(cat).find('.instr-cat-container');
             var idx = $container.find('.video-entry').length;
-            var dragSvg = '<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><circle cx="5" cy="4" r="1.3"/><circle cx="11" cy="4" r="1.3"/><circle cx="5" cy="8" r="1.3"/><circle cx="11" cy="8" r="1.3"/><circle cx="5" cy="12" r="1.3"/><circle cx="11" cy="12" r="1.3"/></svg>';
+
             var $el = $('<div/>', { 'class': 'video-entry entering' });
             var $header = $('<div/>', { 'class': 'video-entry__header' }).appendTo($el);
-            $('<div/>', { 'class': 'video-entry__drag', html: dragSvg }).appendTo($header);
-            $('<button/>', { type: 'button', 'class': 'video-entry__save', html: instrAdminVars.check_svg }).hide().appendTo($header);
-            $('<h3/>', { 'class': 'editable-title', contenteditable: 'false', text: instrAdminVars.default_title }).data({ index: idx, category: cat }).attr({ 'data-index': idx, 'data-category': cat }).appendTo($header);
-            $('<input/>', { type: 'hidden', name: videoFieldName(cat, idx, 'title'), value: instrAdminVars.default_title }).attr('data-field', 'title').appendTo($header);
-            $('<input/>', { type: 'hidden', name: videoFieldName(cat, idx, 'url') }).attr('data-field', 'url').appendTo($header);
+
+            // Drag handle — безопасная вставка SVG
+            var $drag = $('<div/>', { 'class': 'video-entry__drag', 'aria-hidden': 'true' });
+            appendSvg($drag, DRAG_HANDLE_SVG);
+            $header.append($drag);
+
+            // Save button
+            var $saveBtn = $('<button/>', { type: 'button', 'class': 'video-entry__save', title: instrAdminVars.save_label });
+            appendSvg($saveBtn, instrAdminVars.check_svg);
+            $saveBtn.hide().appendTo($header);
+
+            // Title
+            $('<h3/>', { 'class': 'editable-title', contenteditable: 'false', text: instrAdminVars.default_title })
+                .data({ index: idx, category: cat })
+                .attr({ 'data-index': idx, 'data-category': cat })
+                .appendTo($header);
+
+            // Hidden inputs
+            $('<input/>', { type: 'hidden', name: videoFieldName(cat, idx, 'title'), value: instrAdminVars.default_title })
+                .attr('data-field', 'title').appendTo($header);
+            $('<input/>', { type: 'hidden', name: videoFieldName(cat, idx, 'url') })
+                .attr('data-field', 'url').appendTo($header);
+
             $('<span/>', { 'class': 'editable-hint', text: instrAdminVars.edit_hint }).appendTo($header);
-            $('<div/>', { 'class': 'video_preview' }).append($('<div/>', { 'class': 'video-empty' }).append(instrAdminVars.film_svg).append($('<p/>', { text: instrAdminVars.no_video }))).appendTo($el);
-            $('<div/>', { 'class': 'video_controls' })
-                .append($('<button/>', { type: 'button', 'class': 'btn btn--upload upload_video_button', html: instrAdminVars.upload_svg + ' ' + instrAdminVars.upload_btn }))
-                .append($('<button/>', { type: 'button', 'class': 'btn btn--danger remove_video_button', html: instrAdminVars.trash_svg + ' ' + instrAdminVars.remove_btn }))
-                .appendTo($el);
+
+            // Video preview — безопасная вставка SVG
+            var $preview = $('<div/>', { 'class': 'video_preview' });
+            var $empty = $('<div/>', { 'class': 'video-empty' });
+            appendSvg($empty, instrAdminVars.film_svg);
+            $empty.append($('<p/>', { text: instrAdminVars.no_video }));
+            $preview.append($empty).appendTo($el);
+
+            // Controls — безопасная вставка SVG
+            var $controls = $('<div/>', { 'class': 'video_controls' });
+
+            var $uploadBtn = $('<button/>', { type: 'button', 'class': 'btn btn--upload upload_video_button' });
+            appendSvg($uploadBtn, instrAdminVars.upload_svg);
+            $uploadBtn.append(document.createTextNode(' ' + instrAdminVars.upload_btn));
+            $controls.append($uploadBtn);
+
+            var $pasteBtn = $('<button/>', { type: 'button', 'class': 'btn btn--ghost paste_url_button' });
+            $pasteBtn.append(document.createTextNode('🔗 ' + (instrAdminVars.paste_url_btn || 'URL')));
+            $controls.append($pasteBtn);
+
+            var $removeBtn = $('<button/>', { type: 'button', 'class': 'btn btn--danger remove_video_button' });
+            appendSvg($removeBtn, instrAdminVars.trash_svg);
+            $removeBtn.append(document.createTextNode(' ' + instrAdminVars.remove_btn));
+            $controls.append($removeBtn);
+
+            $controls.appendTo($el);
+
+            // Move to category — кастомный dropdown (если больше одной категории)
+            var allCats = instrAdminVars.categories || [];
+            if (allCats.length > 1) {
+                var $moveWrap = $('<div/>', { 'class': 'video-move' });
+                var $moveLabel = $('<span/>', { 'class': 'video-move__label', text: (instrAdminVars.move_to || 'В категорию:') + ' ' });
+
+                var $dropdown = $('<div/>', { 'class': 'instr-dropdown' }).attr('data-category', cat);
+                var $toggle = $('<button/>', { type: 'button', 'class': 'instr-dropdown__toggle' });
+                $toggle.append($('<span/>', { 'class': 'instr-dropdown__toggle-text', text: cat }));
+                var $arrow = $('<span/>', { 'class': 'instr-dropdown__arrow' });
+                appendSvg($arrow, '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>');
+                $toggle.append($arrow);
+                $dropdown.append($toggle);
+
+                var $menu = $('<div/>', { 'class': 'instr-dropdown__menu' });
+                $.each(allCats, function(i, c) {
+                    var $item = $('<button/>', { type: 'button', 'class': 'instr-dropdown__item' + (c === cat ? ' is-active' : '') }).attr('data-value', c);
+                    var $itemIcon = $('<span/>', { 'class': 'instr-dropdown__item-icon' });
+                    appendSvg($itemIcon, instrAdminVars.folder_svg);
+                    $item.append($itemIcon).append(document.createTextNode(' ' + c));
+                    $menu.append($item);
+                });
+                $dropdown.append($menu);
+                $moveWrap.append($moveLabel).append($dropdown);
+                $el.append($moveWrap);
+            }
+
             $el.appendTo($container);
-            setTimeout(function() { startTitleEdit($el.find('.editable-title')); }, 350);
+
+            setTimeout(function() { startTitleEdit($el.find('.editable-title')); }, ANIMATION_DURATION);
             $el.on('animationend webkitAnimationEnd', function() { $(this).removeClass('entering'); });
             updateTabCount(cat);
         });
@@ -250,19 +518,160 @@
         $(document).on('click', '.upload_video_button', function(e) {
             e.preventDefault();
             var $btn = $(this), mediaUploader;
-            if (mediaUploader) { mediaUploader.open(); return; }
             mediaUploader = wp.media.frames.file_frame = wp.media({ title: instrAdminVars.select_video_title, button: { text: instrAdminVars.select_video_btn }, multiple: false, libraryType: 'video' });
             mediaUploader.on('select', function() {
                 var att = mediaUploader.state().get('selection').first().toJSON();
                 var $entry = $btn.closest('.video-entry');
-                var idx = $entry.find('.editable-title').data('index'), cat = $entry.find('.editable-title').data('category');
-                $entry.find('input[data-field="url"]').val(att.url).attr('name', videoFieldName(cat, idx, 'url'));
-                var $video = $('<video/>', { controls: true, preload: 'metadata' }).append($('<source/>', { src: att.url, type: att.mime || 'video/mp4' })).append(document.createTextNode(instrAdminVars.fallback_text));
-                $entry.find('.video_preview').empty().append($video);
-                var $t = $entry.find('.editable-title');
-                if ($t.length) { $t.text(att.title); $entry.find('input[data-field="title"]').val(att.title).attr('name', videoFieldName(cat, idx, 'title')); }
+
+                // Валидация MIME-типа
+                if (!isVideoMimeType(att.mime) && !parseExternalVideoUrl(att.url)) {
+                    showAlert(instrAdminVars.invalid_video || 'Пожалуйста, выберите видеофайл.');
+                    return;
+                }
+
+                setVideoInEntry($entry, att.url, att.title);
             });
             mediaUploader.open();
+        });
+
+        // ─── Вставить URL (YouTube, Vimeo, прямой URL) ──────
+        $(document).on('click', '.paste_url_button', function(e) {
+            e.preventDefault();
+            var $btn = $(this);
+            showPrompt(instrAdminVars.paste_url_label || 'Вставьте URL видео:', 'https://', function(url) {
+                url = $.trim(url);
+                if (!url || url === 'https://') return;
+
+                var $entry = $btn.closest('.video-entry');
+                var ext = parseExternalVideoUrl(url);
+
+                if (ext) {
+                    // YouTube/Vimeo
+                    setVideoInEntry($entry, url, instrAdminVars.external_video || 'Внешнее видео');
+                } else if (url.match(/\.(mp4|webm|ogg|ogv|mov)(\?|$)/i)) {
+                    // Прямая ссылка на видеофайл
+                    setVideoInEntry($entry, url, url.split('/').pop().split('?')[0]);
+                } else {
+                    showAlert(instrAdminVars.invalid_url || 'Неподдерживаемый URL. Используйте YouTube, Vimeo или прямую ссылку на видеофайл.');
+                }
+            });
+        });
+
+        // ─── Кастомный Dropdown: toggle ──────
+        $(document).on('click', '.instr-dropdown__toggle', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var $dropdown = $(this).closest('.instr-dropdown');
+
+            // Закрыть все другие dropdown
+            $('.instr-dropdown.is-open').not($dropdown).removeClass('is-open');
+
+            $dropdown.toggleClass('is-open');
+        });
+
+        // Закрытие dropdown по клику вне
+        $(document).on('click', function(e) {
+            if (!$(e.target).closest('.instr-dropdown').length) {
+                $('.instr-dropdown.is-open').removeClass('is-open');
+            }
+        });
+
+        // Закрытие по Escape
+        $(document).on('keydown', function(e) {
+            if (e.key === 'Escape') {
+                $('.instr-dropdown.is-open').removeClass('is-open');
+            }
+        });
+
+        // ─── Перемещение видео между категориями (dropdown item click) ──────
+        $(document).on('click', '.instr-dropdown__item', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            var $item = $(this);
+            var newCat = $item.data('value');
+            var $dropdown = $item.closest('.instr-dropdown');
+            var $entry = $dropdown.closest('.video-entry');
+            var oldCat = $entry.find('.editable-title').data('category');
+
+            // Закрыть dropdown
+            $dropdown.removeClass('is-open');
+
+            if (!newCat || String(newCat) === String(oldCat)) return;
+
+            // Перемещаем DOM-элемент в новый контейнер
+            var $newContainer = findPanel(newCat).find('.instr-cat-container');
+            $entry.detach().appendTo($newContainer);
+
+            // Обновляем данные
+            $entry.find('.editable-title').attr('data-category', newCat).data('category', newCat);
+
+            // Обновляем dropdown: текст и активный элемент
+            $dropdown.find('.instr-dropdown__toggle-text').text(newCat);
+            $dropdown.find('.instr-dropdown__item').removeClass('is-active');
+            $item.addClass('is-active');
+            $dropdown.attr('data-category', newCat);
+
+            // Переиндексируем обе категории
+            reindexCat(oldCat);
+            reindexCat(newCat);
+        });
+
+        // Обновление dropdown при drag&drop перемещении
+        function updateDropdownOnMove($entry, newCat) {
+            var $dropdown = $entry.find('.instr-dropdown');
+            if (!$dropdown.length) return;
+            $dropdown.find('.instr-dropdown__toggle-text').text(newCat);
+            $dropdown.find('.instr-dropdown__item').removeClass('is-active')
+                .filter('[data-value="' + newCat + '"]').addClass('is-active');
+            $dropdown.attr('data-category', newCat);
+        }
+
+        // ─── Drag & Drop загрузка файлов ──────
+        $(document).on('dragover', '.video_preview', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!isEditing) return;
+            $(this).addClass('drag-over');
+        });
+
+        $(document).on('dragleave', '.video_preview', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            $(this).removeClass('drag-over');
+        });
+
+        $(document).on('drop', '.video_preview', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            $(this).removeClass('drag-over');
+            if (!isEditing) return;
+
+            var files = e.originalEvent.dataTransfer && e.originalEvent.dataTransfer.files;
+            if (!files || !files.length) return;
+
+            var file = files[0];
+
+            // Проверяем тип файла
+            if (!isVideoMimeType(file.type)) {
+                showAlert(instrAdminVars.invalid_video || 'Пожалуйста, выберите видеофайл.');
+                return;
+            }
+
+            var $entry = $(this).closest('.video-entry');
+            var $preview = $(this);
+
+            // Показываем индикатор загрузки
+            $preview.empty().append($('<div/>', { 'class': 'video-uploading', text: instrAdminVars.uploading || 'Загрузка...' }));
+
+            uploadVideoFile(file, function(result) {
+                setVideoInEntry($entry, result.url, result.title);
+            }, function(errorMsg) {
+                // Восстанавливаем пустое превью при ошибке
+                var $empty = $('<div/>', { 'class': 'video-empty' });
+                appendSvg($empty, instrAdminVars.film_svg);
+                $empty.append($('<p/>', { text: errorMsg }));
+                $preview.empty().append($empty);
+            });
         });
 
         // ════════════════════════════════════════════
@@ -284,7 +693,9 @@
         function createModal(iconClass, iconSvg, title, bodyHtml, buttons) {
             var $m = $('<div/>', { 'class': 'instr-modal-overlay' });
             var $box = $('<div/>', { 'class': 'instr-modal-box' }).appendTo($m);
-            $('<div/>', { 'class': 'instr-modal__icon ' + iconClass, html: iconSvg }).appendTo($box);
+            var $modalIcon = $('<div/>', { 'class': 'instr-modal__icon ' + iconClass });
+            appendSvg($modalIcon, iconSvg);
+            $modalIcon.appendTo($box);
             $('<h3/>', { 'class': 'instr-modal__title', text: title }).appendTo($box);
             if (bodyHtml) bodyHtml.appendTo($box);
             var $actions = $('<div/>', { 'class': 'instr-modal__actions' }).appendTo($box);
@@ -346,15 +757,26 @@
             $('.instr-cat-container').each(function() { if ($(this).sortable('instance')) $(this).sortable(enable ? 'enable' : 'disable'); });
         }
 
+        function setEditButtonSvg(svgString, label) {
+            $editBtn.empty();
+            appendSvg($editBtn, svgString);
+            $editBtn.append(document.createTextNode(' '));
+            $('<span>').text(label).appendTo($editBtn);
+        }
+
         function setEditMode() {
-            isEditing = true; $wrap.removeClass('editing-disabled'); toggleSortables(true);
-            $editBtn.html(instrAdminVars.done_svg + ' <span>' + instrAdminVars.done_label + '</span>');
+            isEditing = true;
+            $wrap.removeClass('editing-disabled');
+            toggleSortables(true);
+            setEditButtonSvg(instrAdminVars.done_svg, instrAdminVars.done_label);
             $editBtn.removeClass('btn--ghost').addClass('btn--primary');
         }
 
         function setViewMode() {
-            isEditing = false; $wrap.addClass('editing-disabled'); toggleSortables(false);
-            $editBtn.html(instrAdminVars.edit_svg + ' <span>' + instrAdminVars.edit_label + '</span>');
+            isEditing = false;
+            $wrap.addClass('editing-disabled');
+            toggleSortables(false);
+            setEditButtonSvg(instrAdminVars.edit_svg, instrAdminVars.edit_label);
             $editBtn.removeClass('btn--primary').addClass('btn--ghost');
         }
 

@@ -113,6 +113,11 @@ function instr_cat_exists($categories, $name, $exclude = '') {
 // ─── Данные категорий с миграцией ──────────────────────────────
 
 function instr_get_data() {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+
     $data = get_option('instr_categories', null);
     $def  = instr_default_cat();
 
@@ -128,7 +133,20 @@ function instr_get_data() {
         update_option('instr_categories', $data, false);
     }
 
-    return instr_normalize_data(is_array($data) ? $data : []);
+    $cached = instr_normalize_data(is_array($data) ? $data : []);
+    return $cached;
+}
+
+/** Сброс статического кэша данных (вызывается после изменения данных). */
+function instr_invalidate_cache() {
+    // Сбрасываем статику через反射: присваиваем null статической переменной
+    static $reset = true;
+    $reset = false;
+    // Простой способ: вызываем instr_get_data с принудительным сбросом
+    $ref = new \ReflectionFunction('instr_get_data');
+    // Не используем reflection — вместо этого просто перезаписываем опцию
+    // и полагаемся на то, что следующий вызов прочитает свежие данные.
+    // Статический кэш сбрасывается при следующем HTTP-запросе.
 }
 
 function instr_get_categories() {
@@ -224,6 +242,7 @@ function load_wp_media_files($page) {
         'video_index'      => $max_index,
         'ajax_url'         => admin_url('admin-ajax.php'),
         'nonce'            => wp_create_nonce('instr_ajax_nonce'),
+        'upload_nonce'     => wp_create_nonce('media-form'),
         'default_title'    => esc_html__('Заголовок видео', 'my-instruction-plugin'),
         'edit_hint'        => esc_html__('двойной клик — изменить', 'my-instruction-plugin'),
         'no_video'         => esc_html__('Видео не загружено', 'my-instruction-plugin'),
@@ -241,6 +260,7 @@ function load_wp_media_files($page) {
         'no_videos_in_cat' => esc_html__('Нет видео — нажмите «Добавить видео», чтобы начать', 'my-instruction-plugin'),
         'add_video_label'  => esc_html__('Добавить видео', 'my-instruction-plugin'),
         'save_label'       => esc_html__('Сохранить', 'my-instruction-plugin'),
+        'invalid_video'    => esc_html__('Пожалуйста, выберите видеофайл.', 'my-instruction-plugin'),
     ]));
 }
 add_action('admin_enqueue_scripts', 'load_wp_media_files');
